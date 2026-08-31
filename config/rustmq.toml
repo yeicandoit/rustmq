@@ -1,0 +1,42 @@
+[mqtt]
+bind = "0.0.0.0:1883"
+max_packet_size = 1048576
+max_topic_alias = 65535
+outbound_queue = 1024
+inflight_limit = 32
+offline_queue_limit = 1024
+retry_interval_ms = 30000
+
+[mqtt_tls]
+enabled = false
+bind = "0.0.0.0:8883"
+# certfile = "/path/to/server-cert.pem"
+# keyfile = "/path/to/server-key.pem"
+verify_peer = false
+# When true, every TLS client must present a certificate signed by cacertfile.
+# cacertfile = "/path/to/client-ca.pem"
+
+[mqtt_ws]
+enabled = false
+bind = "0.0.0.0:8083"
+path = "/mqtt"
+
+[mqtt_quic]
+enabled = false
+bind = "0.0.0.0:14567"
+# QUIC requires a TLS 1.3 certificate and private key.
+# certfile = "/path/to/server-cert.pem"
+# keyfile = "/path/to/server-key.pem"
+idle_timeout_ms = 15000
+
+[http]
+bind = "0.0.0.0:18083"
+
+[auth]
+# Set both values to require static credentials. Prefer environment variables
+# RUSTMQ_USERNAME and RUSTMQ_PASSWORD in production.
+# username = "device"
+# password = "change-me"
+
+[node]
+id = "rustmq@localhost"

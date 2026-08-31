@@ -1,0 +1,21 @@
+services:
+  rustmq:
+    build: .
+    image: rustmq:0.1.0
+    container_name: qiangwang4-rustmq
+    restart: unless-stopped
+    ports:
+      - "1883:1883"
+      # Enable [mqtt_ws] before publishing 8083.
+      # - "8083:8083"
+      # Enable [mqtt_tls] and mount certificate files before publishing 8883.
+      # - "8883:8883"
+      # Enable [mqtt_quic] and mount certificate files before publishing UDP 14567.
+      # - "14567:14567/udp"
+      - "18083:18083"
+    environment:
+      RUST_LOG: rustmq=info
+      # RUSTMQ_USERNAME: device
+      # RUSTMQ_PASSWORD: change-me
+    volumes:
+      - ./config/rustmq.toml:/app/config/rustmq.toml:ro
