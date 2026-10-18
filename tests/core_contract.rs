@@ -82,6 +82,8 @@ fn config_environment_overrides_file_values() {
     std::env::set_var("RUSTMQ_MQTT_QUIC_BIND", "127.0.0.1:14568");
     std::env::set_var("RUSTMQ_MQTT_QUIC_CERTFILE", "/tmp/rustmq-quic-cert.pem");
     std::env::set_var("RUSTMQ_MQTT_QUIC_KEYFILE", "/tmp/rustmq-quic-key.pem");
+    std::env::set_var("RUSTMQ_MQTT_QUIC_ENABLE_0RTT", "false");
+    std::env::set_var("RUSTMQ_MQTT_QUIC_MIGRATION_ENABLED", "false");
     std::env::set_var("RUSTMQ_MQTT_QUIC_IDLE_TIMEOUT_MS", "4321");
     std::env::set_var("RUSTMQ_MAX_TOPIC_ALIAS", "123");
     std::env::set_var("RUSTMQ_INFLIGHT_LIMIT", "12");
@@ -102,6 +104,8 @@ fn config_environment_overrides_file_values() {
     std::env::remove_var("RUSTMQ_MQTT_QUIC_BIND");
     std::env::remove_var("RUSTMQ_MQTT_QUIC_CERTFILE");
     std::env::remove_var("RUSTMQ_MQTT_QUIC_KEYFILE");
+    std::env::remove_var("RUSTMQ_MQTT_QUIC_ENABLE_0RTT");
+    std::env::remove_var("RUSTMQ_MQTT_QUIC_MIGRATION_ENABLED");
     std::env::remove_var("RUSTMQ_MQTT_QUIC_IDLE_TIMEOUT_MS");
     std::env::remove_var("RUSTMQ_MAX_TOPIC_ALIAS");
     std::env::remove_var("RUSTMQ_INFLIGHT_LIMIT");
@@ -136,6 +140,8 @@ fn config_environment_overrides_file_values() {
         cfg.mqtt_quic.keyfile.as_deref(),
         Some(std::path::Path::new("/tmp/rustmq-quic-key.pem"))
     );
+    assert!(!cfg.mqtt_quic.enable_0rtt);
+    assert!(!cfg.mqtt_quic.migration_enabled);
     assert_eq!(cfg.mqtt_quic.idle_timeout_ms, 4321);
     assert_eq!(cfg.mqtt.max_packet_size, 2048);
     assert_eq!(cfg.mqtt.max_topic_alias, 123);

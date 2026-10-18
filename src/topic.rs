@@ -7,6 +7,19 @@ pub struct TopicFilter {
     pub shared_group: Option<String>,
 }
 
+pub fn validate_topic_name(value: &str) -> Result<()> {
+    if value.is_empty() || value.as_bytes().contains(&0) {
+        bail!("topic name is empty or contains NUL");
+    }
+    if value.contains(['+', '#']) {
+        bail!("topic name must not contain wildcards");
+    }
+    if value.len() > usize::from(u16::MAX) {
+        bail!("topic name exceeds MQTT UTF-8 length limit");
+    }
+    Ok(())
+}
+
 pub fn parse_filter(value: &str) -> Result<TopicFilter> {
     if value.is_empty() || value.as_bytes().contains(&0) {
         bail!("topic filter is empty or contains NUL");

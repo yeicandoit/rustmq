@@ -27,10 +27,20 @@ pub struct Connect {
     pub session_expiry_interval: u32,
     pub receive_maximum: u16,
     pub topic_alias_maximum: u16,
+    pub authentication_method: Option<String>,
+    pub authentication_data: Option<Bytes>,
     pub username: Option<String>,
     pub password: Option<Bytes>,
     pub will: Option<Will>,
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Auth {
+    pub reason_code: u8,
+    pub authentication_method: Option<String>,
+    pub authentication_data: Option<Bytes>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Publish {
     pub dup: bool,
@@ -66,10 +76,20 @@ pub enum Packet {
         session_present: bool,
         code: u8,
         topic_alias_maximum: Option<u16>,
+        authentication_method: Option<String>,
+        authentication_data: Option<Bytes>,
     },
     Publish(Publish),
     PubAck(u16),
+    PubAckReason {
+        packet_id: u16,
+        reason_code: u8,
+    },
     PubRec(u16),
+    PubRecReason {
+        packet_id: u16,
+        reason_code: u8,
+    },
     PubRel(u16),
     PubComp(u16),
     Subscribe {
@@ -91,6 +111,7 @@ pub enum Packet {
     },
     PingReq,
     PingResp,
+    Auth(Auth),
     Disconnect {
         reason_code: u8,
         session_expiry_interval: Option<u32>,
@@ -317,6 +338,7 @@ fn parse_frame(header: u8, body: &[u8], version: ProtocolVersion) -> Result<Pack
         }
         12 if flags == 0 && body.is_empty() => Packet::PingReq,
         14 if flags == 0 => parse_disconnect(&mut c, version)?,
+        15 if flags == 0 && version == ProtocolVersion::V5 => parse_auth(&mut c)?,
         _ => bail!("unsupported or malformed MQTT packet type {packet_type}"),
     };
     Ok(packet)
@@ -352,12 +374,16 @@ fn parse_connect(c: &mut Cursor<'_>, flags: u8) -> Result<Packet> {
             session_expiry_interval: 0,
             receive_maximum: u16::MAX,
             topic_alias_maximum: 0,
+            authentication_method: None,
+            authentication_data: None,
         }
     } else {
         ConnectProperties {
             session_expiry_interval: u32::MAX,
             receive_maximum: u16::MAX,
             topic_alias_maximum: 0,
+            authentication_method: None,
+            authentication_data: None,
         }
     };
     let client_id = c.string()?;
@@ -402,10 +428,91 @@ fn parse_connect(c: &mut Cursor<'_>, flags: u8) -> Result<Packet> {
         session_expiry_interval: connect_properties.session_expiry_interval,
         receive_maximum: connect_properties.receive_maximum,
         topic_alias_maximum: connect_properties.topic_alias_maximum,
+        authentication_method: connect_properties.authentication_method,
+        authentication_data: connect_properties.authentication_data,
         username,
         password,
         will,
     }))
+}
+
+fn parse_auth(c: &mut Cursor<'_>) -> Result<Packet> {
+    if c.done() {
+        return Ok(Packet::Auth(Auth {
+            reason_code: 0,
+            authentication_method: None,
+            authentication_data: None,
+        }));
+    }
+    let reason_code = c.u8()?;
+    validate_auth_reason(reason_code)?;
+    if c.done() {
+        return Ok(Packet::Auth(Auth {
+            reason_code,
+            authentication_method: None,
+            authentication_data: None,
+        }));
+    }
+    let (authentication_method, authentication_data) =
+        parse_authentication_properties(c.property_bytes()?, "AUTH")?;
+    if !c.done() {
+        bail!("trailing AUTH data")
+    }
+    Ok(Packet::Auth(Auth {
+        reason_code,
+        authentication_method,
+        authentication_data,
+    }))
+}
+
+fn validate_auth_reason(reason_code: u8) -> Result<()> {
+    if matches!(reason_code, 0x00 | 0x18 | 0x19) {
+        Ok(())
+    } else {
+        bail!("invalid AUTH reason code {reason_code:#x}")
+    }
+}
+
+fn parse_authentication_properties(
+    data: &[u8],
+    packet_name: &str,
+) -> Result<(Option<String>, Option<Bytes>)> {
+    let mut properties = Cursor::new(data);
+    let mut authentication_method = None;
+    let mut authentication_data = None;
+    let mut reason_string_seen = false;
+    while !properties.done() {
+        match properties.varint()? {
+            0x15 => {
+                if authentication_method.is_some() {
+                    bail!("duplicate Authentication Method in {packet_name}")
+                }
+                authentication_method = Some(properties.string()?);
+            }
+            0x16 => {
+                if authentication_data.is_some() {
+                    bail!("duplicate Authentication Data in {packet_name}")
+                }
+                authentication_data = Some(Bytes::copy_from_slice(properties.binary()?));
+            }
+            0x1f => {
+                if reason_string_seen {
+                    bail!("duplicate Reason String in {packet_name}")
+                }
+                reason_string_seen = true;
+                properties.string()?;
+            }
+            0x26 => {
+                properties.string()?;
+                properties.string()?;
+            }
+            identifier => bail!("property {identifier:#x} is not valid in {packet_name}"),
+        }
+    }
+    if authentication_data.is_some() && authentication_method.is_none() {
+        bail!("Authentication Data requires Authentication Method in {packet_name}")
+    }
+    Ok((authentication_method, authentication_data))
 }
 
 fn parse_disconnect(c: &mut Cursor<'_>, version: ProtocolVersion) -> Result<Packet> {
@@ -642,6 +749,8 @@ struct ConnectProperties {
     session_expiry_interval: u32,
     receive_maximum: u16,
     topic_alias_maximum: u16,
+    authentication_method: Option<String>,
+    authentication_data: Option<Bytes>,
 }
 
 fn parse_connect_properties(data: &[u8]) -> Result<ConnectProperties> {
@@ -649,8 +758,8 @@ fn parse_connect_properties(data: &[u8]) -> Result<ConnectProperties> {
     let mut session_expiry = None;
     let mut receive_maximum = None;
     let mut topic_alias_maximum = None;
-    let mut auth_method_seen = false;
-    let mut auth_data_seen = false;
+    let mut authentication_method = None;
+    let mut authentication_data = None;
     while !properties.done() {
         match properties.varint()? {
             0x11 => {
@@ -681,18 +790,16 @@ fn parse_connect_properties(data: &[u8]) -> Result<ConnectProperties> {
                 }
             }
             0x15 => {
-                if auth_method_seen {
+                if authentication_method.is_some() {
                     bail!("duplicate Authentication Method")
                 }
-                auth_method_seen = true;
-                properties.string()?;
+                authentication_method = Some(properties.string()?);
             }
             0x16 => {
-                if auth_data_seen {
+                if authentication_data.is_some() {
                     bail!("duplicate Authentication Data")
                 }
-                auth_data_seen = true;
-                properties.binary()?;
+                authentication_data = Some(Bytes::copy_from_slice(properties.binary()?));
             }
             0x26 => {
                 properties.string()?;
@@ -706,13 +813,15 @@ fn parse_connect_properties(data: &[u8]) -> Result<ConnectProperties> {
             identifier => bail!("property {identifier:#x} is not valid in CONNECT"),
         }
     }
-    if auth_data_seen && !auth_method_seen {
+    if authentication_data.is_some() && authentication_method.is_none() {
         bail!("Authentication Data requires Authentication Method")
     }
     Ok(ConnectProperties {
         session_expiry_interval: session_expiry.unwrap_or(0),
         receive_maximum: receive_maximum.unwrap_or(u16::MAX),
         topic_alias_maximum: topic_alias_maximum.unwrap_or(0),
+        authentication_method,
+        authentication_data,
     })
 }
 
@@ -733,9 +842,12 @@ fn put_varint(mut value: usize, out: &mut Vec<u8>) -> Result<()> {
     }
 }
 fn put_string(value: &str, out: &mut Vec<u8>) -> Result<()> {
-    let len = u16::try_from(value.len()).context("string too long")?;
+    put_binary(value.as_bytes(), out)
+}
+fn put_binary(value: &[u8], out: &mut Vec<u8>) -> Result<()> {
+    let len = u16::try_from(value.len()).context("binary value too long")?;
     out.extend_from_slice(&len.to_be_bytes());
-    out.extend_from_slice(value.as_bytes());
+    out.extend_from_slice(value);
     Ok(())
 }
 fn finish(header: u8, body: Vec<u8>) -> Result<Bytes> {
@@ -746,6 +858,25 @@ fn finish(header: u8, body: Vec<u8>) -> Result<Bytes> {
     Ok(out.into())
 }
 
+fn append_authentication_properties(
+    method: Option<&str>,
+    data: Option<&[u8]>,
+    properties: &mut Vec<u8>,
+) -> Result<()> {
+    if data.is_some() && method.is_none() {
+        bail!("Authentication Data requires Authentication Method")
+    }
+    if let Some(method) = method {
+        properties.push(0x15);
+        put_string(method, properties)?;
+    }
+    if let Some(data) = data {
+        properties.push(0x16);
+        put_binary(data, properties)?;
+    }
+    Ok(())
+}
+
 pub fn encode_packet(packet: &Packet, version: ProtocolVersion) -> Result<Bytes> {
     let mut body = Vec::new();
     let (header, empty) = match packet {
@@ -753,18 +884,27 @@ pub fn encode_packet(packet: &Packet, version: ProtocolVersion) -> Result<Bytes>
             session_present,
             code,
             topic_alias_maximum,
+            authentication_method,
+            authentication_data,
         } => {
             body.push(u8::from(*session_present));
             body.push(*code);
             if version == ProtocolVersion::V5 {
+                let mut properties = Vec::new();
                 if let Some(maximum) = topic_alias_maximum {
-                    body.push(3);
-                    body.push(0x22);
-                    body.extend_from_slice(&maximum.to_be_bytes());
-                } else {
-                    body.push(0);
+                    properties.push(0x22);
+                    properties.extend_from_slice(&maximum.to_be_bytes());
                 }
-            };
+                append_authentication_properties(
+                    authentication_method.as_deref(),
+                    authentication_data.as_deref(),
+                    &mut properties,
+                )?;
+                put_varint(properties.len(), &mut body)?;
+                body.extend(properties);
+            } else if authentication_method.is_some() || authentication_data.is_some() {
+                bail!("Authentication properties are only valid in MQTT 5 CONNACK")
+            }
             (0x20, false)
         }
         Packet::Publish(p) => {
@@ -814,8 +954,30 @@ pub fn encode_packet(packet: &Packet, version: ProtocolVersion) -> Result<Bytes>
             body.extend_from_slice(&id.to_be_bytes());
             (0x40, false)
         }
+        Packet::PubAckReason {
+            packet_id,
+            reason_code,
+        } => {
+            body.extend_from_slice(&packet_id.to_be_bytes());
+            if version == ProtocolVersion::V5 {
+                body.push(*reason_code);
+                body.push(0);
+            }
+            (0x40, false)
+        }
         Packet::PubRec(id) => {
             body.extend_from_slice(&id.to_be_bytes());
+            (0x50, false)
+        }
+        Packet::PubRecReason {
+            packet_id,
+            reason_code,
+        } => {
+            body.extend_from_slice(&packet_id.to_be_bytes());
+            if version == ProtocolVersion::V5 {
+                body.push(*reason_code);
+                body.push(0);
+            }
             (0x50, false)
         }
         Packet::PubRel(id) => {
@@ -843,6 +1005,30 @@ pub fn encode_packet(packet: &Packet, version: ProtocolVersion) -> Result<Bytes>
             (0xb0, false)
         }
         Packet::PingResp => (0xd0, true),
+        Packet::Auth(auth) => {
+            if version != ProtocolVersion::V5 {
+                bail!("AUTH is only valid in MQTT 5")
+            }
+            validate_auth_reason(auth.reason_code)?;
+            let has_properties =
+                auth.authentication_method.is_some() || auth.authentication_data.is_some();
+            if auth.reason_code == 0 && !has_properties {
+                (0xf0, true)
+            } else {
+                body.push(auth.reason_code);
+                if has_properties {
+                    let mut properties = Vec::new();
+                    append_authentication_properties(
+                        auth.authentication_method.as_deref(),
+                        auth.authentication_data.as_deref(),
+                        &mut properties,
+                    )?;
+                    put_varint(properties.len(), &mut body)?;
+                    body.extend(properties);
+                }
+                (0xf0, false)
+            }
+        }
         Packet::Disconnect {
             reason_code,
             session_expiry_interval,

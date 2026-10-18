@@ -27,16 +27,98 @@ bind = "0.0.0.0:14567"
 # QUIC requires a TLS 1.3 certificate and private key.
 # certfile = "/path/to/server-cert.pem"
 # keyfile = "/path/to/server-key.pem"
+verify_peer = false
+# When true, every QUIC client must present a certificate signed by cacertfile.
+# cacertfile = "/path/to/client-ca.pem"
+# Accept resumed TLS 1.3 early data. MQTT operations sent in 0-RTT can be replayed;
+# clients must use application-level idempotency where duplicate effects matter.
+# This is ignored when verify_peer = true so MQTT waits for client authentication.
+enable_0rtt = true
+# Advertise and accept QUIC active connection migration/NAT rebinding.
+migration_enabled = true
+# Maximum concurrent client-initiated bidirectional streams, including the control stream.
+peer_bidi_stream_count = 10
 idle_timeout_ms = 15000
 
 [http]
 bind = "0.0.0.0:18083"
 
+[management]
+# Disabled by default. Protected /api/v5 routes use only HTTP Basic with this
+# independent key/secret pair; they do not reuse MQTT anonymous/auth settings.
+enabled = false
+# These bounds are validated only when management is enabled. List handlers keep at
+# most max_page_limit owned matches, return 503 when that bound is exceeded, and use
+# four shared snapshot slots to cap concurrent scans. JSON bodies use max_body_bytes.
+max_page_limit = 10000
+max_body_bytes = 1048576
+# Prefer RUSTMQ_MANAGEMENT_API_KEY and RUSTMQ_MANAGEMENT_API_SECRET in production.
+# api_key = "dashboard"
+# api_secret = "change-me"
+# The management listener is plain HTTP. Bind it to loopback or place it behind a
+# TLS reverse proxy; never expose reusable Basic credentials over an untrusted network.
+
 [auth]
-# Set both values to require static credentials. Prefer environment variables
-# RUSTMQ_USERNAME and RUSTMQ_PASSWORD in production.
+# Set both values to require static credentials. The same pair supports classic
+# CONNECT username/password and MQTT 5 Enhanced Authentication method `PLAIN`.
+# PLAIN Authentication Data is SASL PLAIN: [authzid] NUL authcid NUL password.
+# PLAIN transmits reusable credentials and should be used only over TLS or QUIC
+# (WSS is not currently available). With neither value configured, method-less
+# CONNECT remains anonymous, but an explicit Enhanced Authentication request is
+# rejected because no provider is available. Configuring only one value fails closed.
+# Initial Enhanced Authentication uses one absolute deadline that client traffic
+# cannot refresh. Override this value with RUSTMQ_AUTH_TIMEOUT_MS.
+timeout_ms = 15000
+# Prefer RUSTMQ_USERNAME and RUSTMQ_PASSWORD in production.
 # username = "device"
 # password = "change-me"
+
+[authorization]
+# EMQX-compatible migration default: unmatched operations are allowed. For the
+# secure allow-list example below, change this to "deny" and uncomment every
+# [[authorization.rules]] block after configuring [auth].
+no_match = "allow"
+deny_action = "ignore"
+cache_capacity = 32
+# Simple overrides: RUSTMQ_AUTHZ_NO_MATCH, RUSTMQ_AUTHZ_DENY_ACTION, and
+# RUSTMQ_AUTHZ_CACHE_CAPACITY. Rules are intentionally TOML-only.
+
+# [[authorization.rules]]
+# permission = "allow"
+# action = "publish"
+# principal = "device"
+# topics = ["devices/${principal}/telemetry/#"]
+# qos = [0, 1]
+# retain = false
+
+# [[authorization.rules]]
+# permission = "allow"
+# action = "subscribe"
+# principal = "device"
+# topics = ["devices/${principal}/commands/#", "clients/${clientid}/#"]
+# qos = [0, 1, 2]
+
+# Rules are strict first-match in this order. This final rule denies ordinary
+# topics explicitly; no_match = "deny" closes all remaining namespaces too.
+# [[authorization.rules]]
+# permission = "deny"
+# action = "all"
+# topics = ["#"]
+
+[persistence]
+# Optional single-node durable mode. The default remains a pure in-memory broker.
+enabled = false
+path = "data/rustmq.redb"
+# true commits critical mutations with redb Immediate durability before the Broker API
+# returns. false uses Eventual write-back for throughput: graceful shutdown flushes a
+# barrier, but an unexpected process/host crash can lose the most recent acknowledged
+# mutations. Eventual mode only relaxes crash RPO; any detected transaction or flush
+# error terminates the process immediately so protocol handling cannot continue fail-open.
+sync = true
+# Bounded handoff to the one persistence writer thread; zero is rejected at startup.
+writer_queue_capacity = 1024
+# Environment overrides: RUSTMQ_PERSISTENCE_ENABLED, RUSTMQ_PERSISTENCE_PATH,
+# RUSTMQ_PERSISTENCE_SYNC, and RUSTMQ_PERSISTENCE_WRITER_QUEUE_CAPACITY.
 
 [node]
 id = "rustmq@localhost"

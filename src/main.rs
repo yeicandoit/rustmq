@@ -14,7 +14,7 @@ async fn main() -> Result<()> {
     let config_path = config_path();
     let config = Config::load(&config_path)
         .with_context(|| format!("load configuration {}", config_path.display()))?;
-    let broker = Broker::with_limits(config.mqtt.inflight_limit, config.mqtt.offline_queue_limit);
+    let broker = Broker::open(&config).context("open and recover broker state")?;
     let running = spawn(config, broker).await?;
     tracing::info!(
         mqtt = %running.mqtt_addr,
@@ -25,9 +25,11 @@ async fn main() -> Result<()> {
         "RustMQ started"
     );
 
-    wait_for_shutdown().await?;
+    let signal_result = wait_for_shutdown().await;
     tracing::info!("RustMQ shutting down");
-    running.shutdown().await
+    let shutdown_result = running.shutdown().await;
+    signal_result?;
+    shutdown_result
 }
 
 fn config_path() -> PathBuf {
