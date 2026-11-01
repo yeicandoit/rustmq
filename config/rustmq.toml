@@ -1,5 +1,5 @@
 [mqtt]
-bind = "0.0.0.0:1883"
+bind = "0.0.0.0:1884"
 max_packet_size = 1048576
 max_topic_alias = 65535
 outbound_queue = 1024
@@ -44,7 +44,7 @@ idle_timeout_ms = 15000
 bind = "0.0.0.0:18083"
 
 [management]
-# Disabled by default. Protected /api/v5 routes use only HTTP Basic with this
+# Disabled by default. Protected /api/v5 routes accept HTTP Basic with this
 # independent key/secret pair; they do not reuse MQTT anonymous/auth settings.
 enabled = false
 # These bounds are validated only when management is enabled. List handlers keep at
@@ -55,8 +55,25 @@ max_body_bytes = 1048576
 # Prefer RUSTMQ_MANAGEMENT_API_KEY and RUSTMQ_MANAGEMENT_API_SECRET in production.
 # api_key = "dashboard"
 # api_secret = "change-me"
+# Optional EMQX-style Dashboard users and Bearer sessions. The configured pair
+# bootstraps the protected default administrator only when that username is absent;
+# API password changes are not overwritten on restart. Usernames accept ASCII letters,
+# digits, and underscores (max 100 bytes). Passwords require 8-64 ASCII bytes and at
+# least two character groups. Passwords are stored as bounded Argon2id PHC hashes.
+# Successful Bearer use extends its lifetime; POST /api/v5/logout revokes it. Sessions
+# are process-local, bounded, and lost on restart. Dashboard users, dynamic API keys,
+# and MQTT bans are restart-durable when [persistence] is enabled; their mutations
+# always use Immediate durability even if persistence.sync is false.
+bearer_enabled = false
+bearer_token_ttl_ms = 3600000
+bearer_max_tokens = 10000
+# Prefer RUSTMQ_MANAGEMENT_DASHBOARD_USERNAME and
+# RUSTMQ_MANAGEMENT_DASHBOARD_PASSWORD in production.
+# dashboard_username = "admin"
+# dashboard_password = "change-me"
 # The management listener is plain HTTP. Bind it to loopback or place it behind a
-# TLS reverse proxy; never expose reusable Basic credentials over an untrusted network.
+# TLS reverse proxy; never expose reusable credentials or Bearer tokens over an
+# untrusted network.
 
 [auth]
 # Set both values to require static credentials. The same pair supports classic

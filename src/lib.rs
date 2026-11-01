@@ -1,9 +1,12 @@
 pub mod auth;
 pub mod authorization;
+pub mod banned;
 pub mod broker;
 pub mod cluster;
 pub mod config;
+pub mod dashboard_users;
 pub mod management;
+pub mod management_api_keys;
 pub mod persistence;
 pub mod protocol;
 pub mod server;

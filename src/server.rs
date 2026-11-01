@@ -2,16 +2,16 @@ use std::{
     collections::{HashMap, HashSet},
     fs::File,
     io::BufReader,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{bail, Context, Result};
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        State,
+        ConnectInfo, State,
     },
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
@@ -89,6 +89,23 @@ impl RunningServer {
 
 pub async fn spawn(config: Config, broker: Broker) -> Result<RunningServer> {
     config.validate_management()?;
+    if config.management.bearer_enabled {
+        let users = broker.dashboard_users();
+        let username = config
+            .management
+            .dashboard_username
+            .clone()
+            .expect("validated Dashboard username");
+        let password = config
+            .management
+            .dashboard_password
+            .clone()
+            .expect("validated Dashboard password");
+        tokio::task::spawn_blocking(move || users.bootstrap(username, password))
+            .await
+            .context("join Dashboard user bootstrap")?
+            .map_err(|error| anyhow::anyhow!("bootstrap Dashboard user: {error:?}"))?;
+    }
     let authorization = AuthorizationEngine::compile(&config.authorization)
         .context("compile authorization configuration")?;
     let tls_acceptor = if config.mqtt_tls.enabled {
@@ -166,6 +183,7 @@ pub async fn spawn(config: Config, broker: Broker) -> Result<RunningServer> {
                             connection_config,
                             connection_broker,
                             connection_authorization,
+                            peer.ip(),
                             connection_rx,
                         ).await {
                             tracing::debug!(%peer, %error, "MQTT connection closed");
@@ -225,6 +243,7 @@ pub async fn spawn(config: Config, broker: Broker) -> Result<RunningServer> {
                                 connection_config,
                                 connection_broker,
                                 connection_authorization,
+                                peer.ip(),
                                 connection_rx,
                             ).await {
                                 tracing::debug!(%peer, %error, "MQTT TLS connection closed");
@@ -262,12 +281,15 @@ pub async fn spawn(config: Config, broker: Broker) -> Result<RunningServer> {
             .with_state(websocket_state);
         let mut websocket_shutdown = shutdown.subscribe();
         Some(tokio::spawn(async move {
-            axum::serve(listener, websocket_app)
-                .with_graceful_shutdown(async move {
-                    let _ = websocket_shutdown.recv().await;
-                })
-                .await
-                .context("MQTT WebSocket server")
+            axum::serve(
+                listener,
+                websocket_app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(async move {
+                let _ = websocket_shutdown.recv().await;
+            })
+            .await
+            .context("MQTT WebSocket server")
         }))
     } else {
         None
@@ -397,6 +419,7 @@ async fn handle_quic_connection(
         config.clone(),
         broker.clone(),
         authorization,
+        peer.ip(),
         shutdown.resubscribe(),
         Some(activation_tx),
     ));
@@ -791,6 +814,7 @@ struct WebSocketState {
 
 async fn mqtt_websocket(
     State(state): State<WebSocketState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     websocket: WebSocketUpgrade,
 ) -> Response {
@@ -811,10 +835,10 @@ async fn mqtt_websocket(
     websocket
         .max_message_size(state.config.mqtt.max_packet_size.saturating_add(5))
         .protocols([protocol])
-        .on_upgrade(move |socket| run_websocket_connection(socket, state))
+        .on_upgrade(move |socket| run_websocket_connection(socket, state, peer.ip()))
 }
 
-async fn run_websocket_connection(socket: WebSocket, state: WebSocketState) {
+async fn run_websocket_connection(socket: WebSocket, state: WebSocketState, peer_host: IpAddr) {
     state
         .broker
         .metrics()
@@ -826,6 +850,7 @@ async fn run_websocket_connection(socket: WebSocket, state: WebSocketState) {
         state.config.clone(),
         state.broker.clone(),
         state.authorization.clone(),
+        peer_host,
         state.shutdown.subscribe(),
     ));
     let mut bridge = Box::pin(bridge_websocket(
@@ -1105,6 +1130,7 @@ struct ConnectRuntime<'a> {
     broker: &'a Broker,
     config: &'a Config,
     authorization: &'a Arc<AuthorizationEngine>,
+    peer_host: IpAddr,
     outbound: &'a mpsc::Sender<Outbound>,
     disconnect: &'a mpsc::Sender<()>,
     administrative_disconnect: &'a mpsc::Sender<AdministrativeDisconnect>,
@@ -1117,12 +1143,22 @@ async fn handle_connection<S>(
     config: Config,
     broker: Broker,
     authorization: Arc<AuthorizationEngine>,
+    peer_host: IpAddr,
     shutdown: broadcast::Receiver<()>,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    handle_connection_with_activation(stream, config, broker, authorization, shutdown, None).await
+    handle_connection_with_activation(
+        stream,
+        config,
+        broker,
+        authorization,
+        peer_host,
+        shutdown,
+        None,
+    )
+    .await
 }
 
 async fn handle_connection_with_activation<S>(
@@ -1130,6 +1166,7 @@ async fn handle_connection_with_activation<S>(
     config: Config,
     broker: Broker,
     authorization: Arc<AuthorizationEngine>,
+    peer_host: IpAddr,
     mut shutdown: broadcast::Receiver<()>,
     activation: Option<watch::Sender<Option<QuicDataContext>>>,
 ) -> Result<()>
@@ -1158,6 +1195,7 @@ where
         broker: &broker,
         config: &config,
         authorization: &authorization,
+        peer_host,
         outbound: &outbound_tx,
         disconnect: &disconnect_tx,
         administrative_disconnect: &administrative_disconnect_tx,
@@ -1241,6 +1279,16 @@ where
                         Packet::Connect(connect)
                             if state.is_none() && pending_connect.is_none() =>
                         {
+                            if connection_is_banned(&connect_runtime, &connect) {
+                                write_failed_connack(
+                                    &mut writer,
+                                    banned_connack_code(connect.version),
+                                    connect.version,
+                                )
+                                .await?;
+                                normal_disconnect = true;
+                                break;
+                            }
                             if let Some(method) = connect.authentication_method.clone() {
                                 match provider.start(AuthCredential {
                                     method: &method,
@@ -1943,6 +1991,15 @@ async fn complete_connect<W: AsyncWriteExt + Unpin>(
     principal: Option<String>,
     authentication_data: Option<bytes::Bytes>,
 ) -> Result<ConnectionState> {
+    if connection_is_banned(runtime, &connect) {
+        write_failed_connack(
+            writer,
+            banned_connack_code(connect.version),
+            connect.version,
+        )
+        .await?;
+        bail!("connection rejected by ban rule");
+    }
     let authorization = runtime
         .authorization
         .session(principal, connect.client_id.clone());
@@ -2015,6 +2072,30 @@ async fn complete_connect<W: AsyncWriteExt + Unpin>(
         activation.send_replace(Some(data_context));
     }
     Ok(state)
+}
+
+fn connection_is_banned(runtime: &ConnectRuntime<'_>, connect: &Connect) -> bool {
+    runtime.broker.bans().is_banned(
+        &connect.client_id,
+        connect.username.as_deref(),
+        runtime.peer_host,
+        current_epoch_seconds(),
+    )
+}
+
+fn banned_connack_code(version: ProtocolVersion) -> u8 {
+    if version == ProtocolVersion::V5 {
+        0x8a
+    } else {
+        5
+    }
+}
+
+fn current_epoch_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 async fn write_failed_connack<W: AsyncWriteExt + Unpin>(
