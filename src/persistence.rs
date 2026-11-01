@@ -10,18 +10,31 @@ use redb::{Database, Durability, ReadableTable, ReadableTableMetadata, TableDefi
 use serde::{Deserialize, Serialize};
 use tokio::runtime::RuntimeFlavor;
 
-use crate::{config::PersistenceConfig, topic::parse_filter};
+use crate::{
+    banned::{validate_persistent_ban, MAX_BANS},
+    config::PersistenceConfig,
+    dashboard_users::validate_persistent_dashboard_user,
+    management_api_keys::{validate_persistent_api_key, MAX_API_KEYS},
+    topic::parse_filter,
+};
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 5;
+const PREVIOUS_SCHEMA_VERSIONS: [u32; 3] = [2, 3, 4];
 
 const SESSIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("sessions");
 const RETAINED: TableDefinition<&str, &[u8]> = TableDefinition::new("retained");
 const WILLS: TableDefinition<&str, &[u8]> = TableDefinition::new("wills");
+const API_KEYS: TableDefinition<&str, &[u8]> = TableDefinition::new("api_keys");
+const BANS: TableDefinition<&str, &[u8]> = TableDefinition::new("bans");
+const DASHBOARD_USERS: TableDefinition<&str, &[u8]> = TableDefinition::new("dashboard_users");
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const SCHEMA_KEY: &str = "schema_version";
 const SESSION_REVISION_PREFIX: &str = "revision/session/";
 const RETAINED_REVISION_PREFIX: &str = "revision/retained/";
 const WILL_REVISION_PREFIX: &str = "revision/will/";
+const API_KEY_REVISION_PREFIX: &str = "revision/api_key/";
+const BAN_REVISION_PREFIX: &str = "revision/ban/";
+const DASHBOARD_USER_REVISION_PREFIX: &str = "revision/dashboard_user/";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -130,11 +143,51 @@ pub struct PersistentPendingWill {
     pub firing: bool,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PersistentApiKey {
+    pub name: String,
+    pub revision: u64,
+    pub api_key: String,
+    pub secret_salt: Vec<u8>,
+    pub secret_hash: Vec<u8>,
+    pub enable: bool,
+    pub expired_at_epoch_s: Option<u64>,
+    pub created_at_epoch_s: u64,
+    pub description: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PersistentBan {
+    pub kind: String,
+    pub who: String,
+    pub revision: u64,
+    pub by: String,
+    pub reason: String,
+    pub at_epoch_s: u64,
+    pub until_epoch_s: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PersistentDashboardUser {
+    pub username: String,
+    pub revision: u64,
+    pub password_hash: String,
+    pub description: String,
+    pub role: String,
+    pub auth_epoch: u64,
+}
+
 #[derive(Default)]
 pub struct StoreSnapshot {
     pub sessions: HashMap<String, PersistentSession>,
     pub retained: HashMap<String, PersistentRetained>,
     pub wills: HashMap<String, PersistentPendingWill>,
+    pub api_keys: HashMap<String, PersistentApiKey>,
+    pub bans: HashMap<String, PersistentBan>,
+    pub dashboard_users: HashMap<String, PersistentDashboardUser>,
     pub maximum_revision: u64,
 }
 
@@ -164,6 +217,30 @@ pub enum StoreOperation {
         client_id: String,
         revision: u64,
     },
+    PutApiKey {
+        name: String,
+        record: PersistentApiKey,
+    },
+    DeleteApiKey {
+        name: String,
+        revision: u64,
+    },
+    PutBan {
+        id: String,
+        record: PersistentBan,
+    },
+    DeleteBan {
+        id: String,
+        revision: u64,
+    },
+    PutDashboardUser {
+        username: String,
+        record: PersistentDashboardUser,
+    },
+    DeleteDashboardUser {
+        username: String,
+        revision: u64,
+    },
 }
 
 impl StoreOperation {
@@ -172,9 +249,15 @@ impl StoreOperation {
             Self::PutSession { record, .. } => record.revision,
             Self::DeleteSession { revision, .. }
             | Self::DeleteRetained { revision, .. }
-            | Self::DeleteWill { revision, .. } => *revision,
+            | Self::DeleteWill { revision, .. }
+            | Self::DeleteApiKey { revision, .. }
+            | Self::DeleteBan { revision, .. }
+            | Self::DeleteDashboardUser { revision, .. } => *revision,
             Self::PutRetained { record, .. } => record.revision,
             Self::PutWill { record, .. } => record.revision,
+            Self::PutApiKey { record, .. } => record.revision,
+            Self::PutBan { record, .. } => record.revision,
+            Self::PutDashboardUser { record, .. } => record.revision,
         }
     }
 
@@ -189,12 +272,23 @@ impl StoreOperation {
             Self::PutWill { client_id, .. } | Self::DeleteWill { client_id, .. } => {
                 format!("{WILL_REVISION_PREFIX}{client_id}")
             }
+            Self::PutApiKey { name, .. } | Self::DeleteApiKey { name, .. } => {
+                format!("{API_KEY_REVISION_PREFIX}{name}")
+            }
+            Self::PutBan { id, .. } | Self::DeleteBan { id, .. } => {
+                format!("{BAN_REVISION_PREFIX}{id}")
+            }
+            Self::PutDashboardUser { username, .. }
+            | Self::DeleteDashboardUser { username, .. } => {
+                format!("{DASHBOARD_USER_REVISION_PREFIX}{username}")
+            }
         }
     }
 }
 
 pub trait DurableStore: Send + Sync {
     fn apply(&self, operations: Vec<StoreOperation>) -> Result<()>;
+    fn apply_immediate(&self, operations: Vec<StoreOperation>) -> Result<()>;
     fn flush(&self) -> Result<()>;
     fn is_enabled(&self) -> bool;
 }
@@ -204,6 +298,10 @@ struct DisabledStore;
 
 impl DurableStore for DisabledStore {
     fn apply(&self, _operations: Vec<StoreOperation>) -> Result<()> {
+        Ok(())
+    }
+
+    fn apply_immediate(&self, _operations: Vec<StoreOperation>) -> Result<()> {
         Ok(())
     }
 
@@ -221,6 +319,7 @@ type CommandAck = mpsc::SyncSender<std::result::Result<(), String>>;
 enum StoreCommand {
     AtomicBatch {
         operations: Vec<StoreOperation>,
+        immediate: bool,
         ack: Option<CommandAck>,
     },
     Flush(CommandAck),
@@ -267,6 +366,7 @@ impl DurableStore for WriterStore {
         if self.sync {
             self.send_with_ack(|ack| StoreCommand::AtomicBatch {
                 operations,
+                immediate: true,
                 ack: Some(ack),
             })
         } else {
@@ -274,11 +374,23 @@ impl DurableStore for WriterStore {
                 self.sender
                     .send(StoreCommand::AtomicBatch {
                         operations,
+                        immediate: false,
                         ack: None,
                     })
                     .context("persistence writer stopped")
             })
         }
+    }
+
+    fn apply_immediate(&self, operations: Vec<StoreOperation>) -> Result<()> {
+        if operations.is_empty() {
+            return Ok(());
+        }
+        self.send_with_ack(|ack| StoreCommand::AtomicBatch {
+            operations,
+            immediate: true,
+            ack: Some(ack),
+        })
     }
 
     fn flush(&self) -> Result<()> {
@@ -344,7 +456,7 @@ pub fn open_store(config: &PersistenceConfig) -> Result<(Arc<dyn DurableStore>, 
     let sync = config.sync;
     let handle = thread::Builder::new()
         .name("rustmq-persistence".to_owned())
-        .spawn(move || writer_loop(database, receiver, revisions, sync))
+        .spawn(move || writer_loop(database, receiver, revisions))
         .context("spawn persistence writer")?;
     Ok((
         Arc::new(WriterStore {
@@ -367,6 +479,13 @@ fn initialize_schema(database: &Database) -> Result<()> {
             .open_table(RETAINED)
             .context("open retained table")?;
         let wills = transaction.open_table(WILLS).context("open wills table")?;
+        let api_keys = transaction
+            .open_table(API_KEYS)
+            .context("open API keys table")?;
+        let bans = transaction.open_table(BANS).context("open bans table")?;
+        let dashboard_users = transaction
+            .open_table(DASHBOARD_USERS)
+            .context("open Dashboard users table")?;
         let mut meta = transaction.open_table(META).context("open meta table")?;
         let stored_schema = meta
             .get(SCHEMA_KEY)
@@ -376,7 +495,21 @@ fn initialize_schema(database: &Database) -> Result<()> {
             Some(version) => {
                 let stored: u32 = serde_json::from_slice(&version)
                     .context("decode persistence schema version")?;
-                if stored != SCHEMA_VERSION {
+                if stored == SCHEMA_VERSION {
+                    // Current schema needs no migration.
+                } else if PREVIOUS_SCHEMA_VERSIONS.contains(&stored) {
+                    if !dashboard_users.is_empty()? {
+                        bail!("pre-v5 database unexpectedly contains Dashboard user records");
+                    }
+                    if stored < 4 && !bans.is_empty()? {
+                        bail!("pre-v4 database unexpectedly contains ban records");
+                    }
+                    if stored == 2 && !api_keys.is_empty()? {
+                        bail!("schema v2 database unexpectedly contains API key records");
+                    }
+                    let encoded = serde_json::to_vec(&SCHEMA_VERSION)?;
+                    meta.insert(SCHEMA_KEY, encoded.as_slice())?;
+                } else {
                     bail!(
                         "unsupported persistence schema version {stored}; expected {SCHEMA_VERSION}"
                     );
@@ -386,6 +519,9 @@ fn initialize_schema(database: &Database) -> Result<()> {
                 if !sessions.is_empty()?
                     || !retained.is_empty()?
                     || !wills.is_empty()?
+                    || !api_keys.is_empty()?
+                    || !bans.is_empty()?
+                    || !dashboard_users.is_empty()?
                     || !meta.is_empty()?
                 {
                     bail!("persistence database has records but no schema version");
@@ -437,6 +573,42 @@ fn load_snapshot(database: &Database) -> Result<StoreSnapshot> {
             snapshot.wills.insert(key.value().to_owned(), record);
         }
     }
+    {
+        let table = transaction
+            .open_table(API_KEYS)
+            .context("read API keys table")?;
+        for item in table.iter().context("iterate API keys table")? {
+            let (key, value) = item.context("read API key record")?;
+            let record: PersistentApiKey = serde_json::from_slice(value.value())
+                .with_context(|| format!("decode API key record {}", key.value()))?;
+            snapshot.maximum_revision = snapshot.maximum_revision.max(record.revision);
+            snapshot.api_keys.insert(key.value().to_owned(), record);
+        }
+    }
+    {
+        let table = transaction.open_table(BANS).context("read bans table")?;
+        for item in table.iter().context("iterate bans table")? {
+            let (key, value) = item.context("read ban record")?;
+            let record: PersistentBan = serde_json::from_slice(value.value())
+                .with_context(|| format!("decode ban record {}", key.value()))?;
+            snapshot.maximum_revision = snapshot.maximum_revision.max(record.revision);
+            snapshot.bans.insert(key.value().to_owned(), record);
+        }
+    }
+    {
+        let table = transaction
+            .open_table(DASHBOARD_USERS)
+            .context("read Dashboard users table")?;
+        for item in table.iter().context("iterate Dashboard users table")? {
+            let (key, value) = item.context("read Dashboard user record")?;
+            let record: PersistentDashboardUser = serde_json::from_slice(value.value())
+                .with_context(|| format!("decode Dashboard user record {}", key.value()))?;
+            snapshot.maximum_revision = snapshot.maximum_revision.max(record.revision);
+            snapshot
+                .dashboard_users
+                .insert(key.value().to_owned(), record);
+        }
+    }
     Ok(snapshot)
 }
 
@@ -469,6 +641,20 @@ fn validate_revision_key(key: &str) -> Result<()> {
         validate_client_id(client_id)
     } else if let Some(topic) = key.strip_prefix(RETAINED_REVISION_PREFIX) {
         validate_topic_name(topic)
+    } else if let Some(name) = key.strip_prefix(API_KEY_REVISION_PREFIX) {
+        if crate::management_api_keys::valid_api_key_name(name) {
+            Ok(())
+        } else {
+            bail!("invalid API key revision name")
+        }
+    } else if let Some(id) = key.strip_prefix(BAN_REVISION_PREFIX) {
+        if !crate::banned::valid_ban_storage_key(id) {
+            bail!("invalid ban revision id")
+        }
+        Ok(())
+    } else if let Some(username) = key.strip_prefix(DASHBOARD_USER_REVISION_PREFIX) {
+        crate::dashboard_users::validate_username(username)
+            .map_err(|error| anyhow::anyhow!("invalid Dashboard user revision key: {error:?}"))
     } else {
         bail!("unknown persistence meta key {key}")
     }
@@ -507,6 +693,53 @@ fn validate_snapshot(snapshot: &StoreSnapshot, revisions: &HashMap<String, u64>)
         }
         validate_generation(record.generation, "pending Will generation")?;
         validate_will(&record.will)?;
+    }
+    if snapshot.api_keys.len() > MAX_API_KEYS {
+        bail!("persisted API key count exceeds the supported limit");
+    }
+    let mut public_keys = HashMap::new();
+    for (name, record) in &snapshot.api_keys {
+        validate_record_revision(
+            &format!("{API_KEY_REVISION_PREFIX}{name}"),
+            record.revision,
+            revisions,
+        )?;
+        if record.name != *name {
+            bail!("persisted API key record/name mismatch for {name}");
+        }
+        validate_persistent_api_key(record)
+            .with_context(|| format!("validate persisted API key {name}"))?;
+        if public_keys.insert(record.api_key.as_str(), name).is_some() {
+            bail!("persisted API key contains a duplicate public key");
+        }
+    }
+    if snapshot.bans.len() > MAX_BANS {
+        bail!("persisted ban count exceeds the supported limit");
+    }
+    for (id, record) in &snapshot.bans {
+        validate_record_revision(
+            &format!("{BAN_REVISION_PREFIX}{id}"),
+            record.revision,
+            revisions,
+        )?;
+        validate_persistent_ban(record).with_context(|| format!("validate persisted ban {id}"))?;
+        let kind =
+            crate::banned::BanKind::parse(&record.kind).expect("persisted ban kind was validated");
+        if crate::banned::ban_storage_key(kind, &record.who) != *id {
+            bail!("persisted ban key/record mismatch for {id}");
+        }
+    }
+    for (username, record) in &snapshot.dashboard_users {
+        validate_record_revision(
+            &format!("{DASHBOARD_USER_REVISION_PREFIX}{username}"),
+            record.revision,
+            revisions,
+        )?;
+        if record.username != *username {
+            bail!("persisted Dashboard user key/record mismatch for {username}");
+        }
+        validate_persistent_dashboard_user(record)
+            .with_context(|| format!("validate persisted Dashboard user {username}"))?;
     }
     Ok(())
 }
@@ -647,12 +880,15 @@ fn writer_loop(
     database: Database,
     receiver: mpsc::Receiver<StoreCommand>,
     mut revisions: HashMap<String, u64>,
-    sync: bool,
 ) {
     while let Ok(command) = receiver.recv() {
         match command {
-            StoreCommand::AtomicBatch { operations, ack } => {
-                let result = apply_batch(&database, &operations, &mut revisions, sync);
+            StoreCommand::AtomicBatch {
+                operations,
+                immediate,
+                ack,
+            } => {
+                let result = apply_batch(&database, &operations, &mut revisions, immediate);
                 if let Err(error) = &result {
                     tracing::error!(%error, "hard persistence writer error; aborting process");
                     std::process::abort();
@@ -686,7 +922,7 @@ fn apply_batch(
     database: &Database,
     operations: &[StoreOperation],
     revisions: &mut HashMap<String, u64>,
-    sync: bool,
+    immediate: bool,
 ) -> Result<()> {
     let mut batch_revisions = HashMap::new();
     let accepted: Vec<&StoreOperation> = operations
@@ -718,7 +954,7 @@ fn apply_batch(
     let mut transaction = database
         .begin_write()
         .context("begin persistence transaction")?;
-    transaction.set_durability(if sync {
+    transaction.set_durability(if immediate {
         Durability::Immediate
     } else {
         Durability::Eventual
@@ -727,6 +963,9 @@ fn apply_batch(
         let mut sessions = transaction.open_table(SESSIONS)?;
         let mut retained = transaction.open_table(RETAINED)?;
         let mut wills = transaction.open_table(WILLS)?;
+        let mut api_keys = transaction.open_table(API_KEYS)?;
+        let mut bans = transaction.open_table(BANS)?;
+        let mut dashboard_users = transaction.open_table(DASHBOARD_USERS)?;
         let mut meta = transaction.open_table(META)?;
         for operation in &accepted {
             match operation {
@@ -750,6 +989,27 @@ fn apply_batch(
                 }
                 StoreOperation::DeleteWill { client_id, .. } => {
                     wills.remove(client_id.as_str())?;
+                }
+                StoreOperation::PutApiKey { name, record } => {
+                    let value = serde_json::to_vec(record)?;
+                    api_keys.insert(name.as_str(), value.as_slice())?;
+                }
+                StoreOperation::DeleteApiKey { name, .. } => {
+                    api_keys.remove(name.as_str())?;
+                }
+                StoreOperation::PutBan { id, record } => {
+                    let value = serde_json::to_vec(record)?;
+                    bans.insert(id.as_str(), value.as_slice())?;
+                }
+                StoreOperation::DeleteBan { id, .. } => {
+                    bans.remove(id.as_str())?;
+                }
+                StoreOperation::PutDashboardUser { username, record } => {
+                    let value = serde_json::to_vec(record)?;
+                    dashboard_users.insert(username.as_str(), value.as_slice())?;
+                }
+                StoreOperation::DeleteDashboardUser { username, .. } => {
+                    dashboard_users.remove(username.as_str())?;
                 }
             }
             let key = operation.revision_key();

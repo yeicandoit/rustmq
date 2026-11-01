@@ -18,12 +18,16 @@ const ADMIN_DISCONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 use crate::{
     authorization::{AuthorizationEngine, SubscriptionAuthorization},
+    banned::BanCatalog,
     config::{Config, PersistenceConfig},
+    dashboard_users::DashboardUserCatalog,
+    management_api_keys::ApiKeyCatalog,
     persistence::{
-        open_store, DurableStore, PersistentActiveWill, PersistentInflight,
-        PersistentInflightPhase, PersistentPendingWill, PersistentPublish,
-        PersistentQueuedDelivery, PersistentRetained, PersistentSession, PersistentSubscription,
-        PersistentSubscriptionOptions, PersistentWillMessage, StoreOperation, StoreSnapshot,
+        open_store, DurableStore, PersistentActiveWill, PersistentApiKey, PersistentBan,
+        PersistentDashboardUser, PersistentInflight, PersistentInflightPhase,
+        PersistentPendingWill, PersistentPublish, PersistentQueuedDelivery, PersistentRetained,
+        PersistentSession, PersistentSubscription, PersistentSubscriptionOptions,
+        PersistentWillMessage, StoreOperation, StoreSnapshot,
     },
     protocol::{Packet, Publish, Will},
     topic::{bucket_for_filter, bucket_for_topic, parse_filter, topic_matches},
@@ -248,6 +252,9 @@ struct BrokerInner {
     will_generation: AtomicU64,
     revision: AtomicU64,
     store: Arc<dyn DurableStore>,
+    api_keys: ApiKeyCatalog,
+    bans: BanCatalog,
+    dashboard_users: DashboardUserCatalog,
     shutting_down: AtomicBool,
     will_execution: Mutex<()>,
     metrics: Metrics,
@@ -291,6 +298,9 @@ impl Broker {
                 .maximum_revision
                 .checked_add(1)
                 .expect("disabled persistence revision cannot overflow"),
+            snapshot.api_keys,
+            snapshot.bans,
+            snapshot.dashboard_users,
         )
     }
 
@@ -316,7 +326,15 @@ impl Broker {
             .maximum_revision
             .checked_add(1)
             .context("persistence revision namespace is exhausted")?;
-        let broker = Self::from_store(inflight_limit, offline_queue_limit, store, next_revision);
+        let broker = Self::from_store(
+            inflight_limit,
+            offline_queue_limit,
+            store,
+            next_revision,
+            snapshot.api_keys.clone(),
+            snapshot.bans.clone(),
+            snapshot.dashboard_users.clone(),
+        );
         broker.recover(snapshot, authorization)?;
         broker.flush()?;
         Ok(broker)
@@ -327,7 +345,18 @@ impl Broker {
         offline_queue_limit: usize,
         store: Arc<dyn DurableStore>,
         next_revision: u64,
+        api_key_records: HashMap<String, PersistentApiKey>,
+        ban_records: HashMap<String, PersistentBan>,
+        dashboard_user_records: HashMap<String, PersistentDashboardUser>,
     ) -> Self {
+        let api_keys =
+            ApiKeyCatalog::from_snapshot(api_key_records, Arc::clone(&store), next_revision);
+        let bans = BanCatalog::from_snapshot(ban_records, Arc::clone(&store), next_revision);
+        let dashboard_users = DashboardUserCatalog::from_snapshot(
+            dashboard_user_records,
+            Arc::clone(&store),
+            next_revision,
+        );
         Self {
             inner: Arc::new(BrokerInner {
                 clients: DashMap::new(),
@@ -345,6 +374,9 @@ impl Broker {
                 will_generation: AtomicU64::new(1),
                 revision: AtomicU64::new(next_revision),
                 store,
+                api_keys,
+                bans,
+                dashboard_users,
                 shutting_down: AtomicBool::new(false),
                 will_execution: Mutex::new(()),
                 metrics: Metrics::default(),
@@ -382,6 +414,21 @@ impl Broker {
     #[must_use]
     pub fn persistence_enabled(&self) -> bool {
         self.inner.store.is_enabled()
+    }
+
+    #[must_use]
+    pub fn api_keys(&self) -> ApiKeyCatalog {
+        self.inner.api_keys.clone()
+    }
+
+    #[must_use]
+    pub fn bans(&self) -> BanCatalog {
+        self.inner.bans.clone()
+    }
+
+    #[must_use]
+    pub fn dashboard_users(&self) -> DashboardUserCatalog {
+        self.inner.dashboard_users.clone()
     }
 
     fn next_revision(&self) -> u64 {
@@ -674,6 +721,9 @@ impl Broker {
             sessions,
             retained,
             wills,
+            api_keys: _,
+            bans: _,
+            dashboard_users: _,
             maximum_revision: _,
         } = snapshot;
         for (client_id, record) in &sessions {
@@ -2633,6 +2683,34 @@ impl Broker {
                     anyhow::anyhow!("connection closed before administrative disconnect completed")
                 })?;
         }
+        Ok(true)
+    }
+
+    pub async fn kick_online_client_if_present(&self, client_id: &str) -> Result<bool> {
+        let completion = {
+            let _client_guard = self.client_lock(client_id);
+            let Some(client) = self.inner.clients.get(client_id) else {
+                return Ok(false);
+            };
+            let session_matches = self.inner.sessions.get(client_id).is_some_and(|session| {
+                session.online && session.online_generation == Some(client.token)
+            });
+            if !session_matches {
+                bail!("online client has no matching session generation");
+            }
+            let (completion, receiver) = oneshot::channel();
+            client
+                .administrative_disconnect
+                .try_send(AdministrativeDisconnect { completion })
+                .map_err(|error| anyhow::anyhow!("enqueue administrative disconnect: {error}"))?;
+            receiver
+        };
+        tokio::time::timeout(ADMIN_DISCONNECT_TIMEOUT, completion)
+            .await
+            .map_err(|_| anyhow::anyhow!("administrative disconnect timed out"))?
+            .map_err(|_| {
+                anyhow::anyhow!("connection closed before administrative disconnect completed")
+            })?;
         Ok(true)
     }
 

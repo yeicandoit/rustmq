@@ -13,10 +13,14 @@
 - MQTT QUIC 0-RTT 与连接迁移（TLS 会话恢复、握手前控制/数据流、握手后同流续传、客户端 UDP 地址切换后会话/流连续；mTLS 强制等待完整握手）
 - MQTT 5 Enhanced Authentication（可插拔认证 Provider/跨轮 Cache/Principal 边界、内置 SASL `PLAIN`、初始多轮认证、在线重认证、15 秒绝对认证超时、TCP/TLS/WebSocket/QUIC 共享状态机与 QUIC 数据流认证门控）
 - 静态 ACL/授权（启动时编译的有序 first-match 规则、Principal/ClientId、主题过滤器/精确主题/安全模板、QoS/retain 约束、连接级有界缓存、no-match 与 ignore/disconnect 策略、TCP/TLS/WebSocket/QUIC 控制及数据流统一执行、Will 与 Session 主体隔离）
-- 单节点进程重启持久化（可选 redb schema v2、Session/Control Subscription、retained、出站 QoS 1/2 inflight phase、离线队列、active/pending Will、绝对过期时间、Principal 隔离、优雅关闭刷盘与 SIGKILL 恢复；QUIC 数据流及入站 QoS 2 状态保持临时态）
+- 单节点进程重启持久化（可选 redb schema v5、v2/v3/v4 原位迁移、Session/Control Subscription、retained、出站 QoS 1/2 inflight phase、离线队列、active/pending Will、动态管理 API Key、MQTT bans、Dashboard 用户、绝对过期时间、Principal 隔离、优雅关闭刷盘与 SIGKILL 恢复；QUIC 数据流及入站 QoS 2 状态保持临时态）
 - EMQX 风格核心 `/api/v5` 管理 API（独立 Basic API Key、public status、clients 查询/行政踢出、在线订阅管理、publish/bulk、retained 管理、nodes/stats/metrics、稳定分页/资源上限、持久 mutation 与 MQTT 5 `0x98` 行政断开）
+- EMQX 风格管理 Bearer 会话（持久化多 Dashboard 用户、配置默认管理员 bootstrap、CSPRNG 256-bit token、Basic/Bearer 并行认证、60 分钟可配置滑动过期、容量上限、owner 校验注销、auth_epoch 密码变更/删用户立即撤销；token 单节点进程内、重启失效）
+- EMQX 风格管理 API Key CRUD（Bearer-only 自管理、名称/100 条容量约束、一次性 CSPRNG secret、salted SHA-256 常量时间校验、enable/RFC3339/infinity 过期、动态 Basic 鉴权、本地 DashMap 热路径、redb schema v3 与 Immediate 安全提交、v2 原位迁移；未启用持久化时进程内）
+- EMQX 风格 ban 管理与连接执行（clientid/username/peerhost 精确规则、clientid_re/username_re/peerhost_net 编译规则、稳定分页/过滤/过期、DashMap + ArcSwap 无锁规则快照、TCP/TLS/WebSocket/QUIC 认证前及注册前统一拦截、MQTT 5 `0x8A`/MQTT 3 code 5、精确 clientid 在线 `0x98` 踢出、redb schema v4 Immediate 持久化与 v2/v3 原位迁移）
+- EMQX CE Dashboard 用户与管理权限（用户 list/create/update/delete/change_pwd、默认管理员和自删除保护、8~64 ASCII 混合密码、固定参数 Argon2id、DashMap 鉴权热路径、administrator 角色边界、Basic 对 users/API Key/logout 禁止但可 change_pwd、auth_epoch O(1) token 撤销、redb schema v5 Immediate 持久化与 v2/v3/v4 原位迁移）
 
 仍未实现的主要功能：
-- 完整 EMQX `/api/v5` 高级兼容（Bearer、API Key CRUD、ban enforcement、多节点 RPC、OpenAPI/config API、完整 client/metrics 字段和高级 queue/cache 管理）
 - 真实 OpenRaft/RocksDB 多节点集群
 - 规则引擎、连接器和 Dashboard
+- 完整 EMQX `/api/v5` 高级兼容（企业版 viewer/publisher/自定义 RBAC 与 SSO、API Key bootstrap file/role、自动/flapping ban、ban 发布者消息过滤、多节点 RPC、OpenAPI/config API、完整 client/metrics 字段和高级 queue/cache 管理）,还需要实现此功能啊？

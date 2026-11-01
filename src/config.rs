@@ -81,6 +81,11 @@ pub struct ManagementConfig {
     pub enabled: bool,
     pub api_key: Option<String>,
     pub api_secret: Option<String>,
+    pub bearer_enabled: bool,
+    pub dashboard_username: Option<String>,
+    pub dashboard_password: Option<String>,
+    pub bearer_token_ttl_ms: u64,
+    pub bearer_max_tokens: usize,
     pub max_page_limit: usize,
     pub max_body_bytes: usize,
 }
@@ -91,6 +96,11 @@ impl Default for ManagementConfig {
             enabled: false,
             api_key: None,
             api_secret: None,
+            bearer_enabled: false,
+            dashboard_username: None,
+            dashboard_password: None,
+            bearer_token_ttl_ms: 60 * 60 * 1000,
+            bearer_max_tokens: 10_000,
             max_page_limit: 10_000,
             max_body_bytes: 1024 * 1024,
         }
@@ -104,6 +114,17 @@ impl fmt::Debug for ManagementConfig {
             .field("enabled", &self.enabled)
             .field("api_key_configured", &self.api_key.is_some())
             .field("api_secret_configured", &self.api_secret.is_some())
+            .field("bearer_enabled", &self.bearer_enabled)
+            .field(
+                "dashboard_username_configured",
+                &self.dashboard_username.is_some(),
+            )
+            .field(
+                "dashboard_password_configured",
+                &self.dashboard_password.is_some(),
+            )
+            .field("bearer_token_ttl_ms", &self.bearer_token_ttl_ms)
+            .field("bearer_max_tokens", &self.bearer_max_tokens)
             .field("max_page_limit", &self.max_page_limit)
             .field("max_body_bytes", &self.max_body_bytes)
             .finish()
@@ -259,6 +280,26 @@ impl Config {
         }
         if let Ok(value) = std::env::var("RUSTMQ_MANAGEMENT_API_SECRET") {
             config.management.api_secret = Some(value);
+        }
+        if let Ok(value) = std::env::var("RUSTMQ_MANAGEMENT_BEARER_ENABLED") {
+            config.management.bearer_enabled =
+                value.parse().context("RUSTMQ_MANAGEMENT_BEARER_ENABLED")?;
+        }
+        if let Ok(value) = std::env::var("RUSTMQ_MANAGEMENT_DASHBOARD_USERNAME") {
+            config.management.dashboard_username = Some(value);
+        }
+        if let Ok(value) = std::env::var("RUSTMQ_MANAGEMENT_DASHBOARD_PASSWORD") {
+            config.management.dashboard_password = Some(value);
+        }
+        if let Ok(value) = std::env::var("RUSTMQ_MANAGEMENT_BEARER_TOKEN_TTL_MS") {
+            config.management.bearer_token_ttl_ms = value
+                .parse()
+                .context("RUSTMQ_MANAGEMENT_BEARER_TOKEN_TTL_MS")?;
+        }
+        if let Ok(value) = std::env::var("RUSTMQ_MANAGEMENT_BEARER_MAX_TOKENS") {
+            config.management.bearer_max_tokens = value
+                .parse()
+                .context("RUSTMQ_MANAGEMENT_BEARER_MAX_TOKENS")?;
         }
         if let Ok(value) = std::env::var("RUSTMQ_MANAGEMENT_MAX_PAGE_LIMIT") {
             config.management.max_page_limit =
@@ -416,6 +457,28 @@ impl Config {
         }
         if api_key.len() > 1024 || api_secret.len() > 1024 {
             anyhow::bail!("management api_key and api_secret must not exceed 1024 bytes");
+        }
+        if self.management.bearer_enabled {
+            let (Some(username), Some(password)) = (
+                self.management.dashboard_username.as_deref(),
+                self.management.dashboard_password.as_deref(),
+            ) else {
+                anyhow::bail!(
+                    "management dashboard_username and dashboard_password are required when bearer authentication is enabled"
+                );
+            };
+            crate::dashboard_users::validate_username(username).map_err(|error| {
+                anyhow::anyhow!("invalid management dashboard_username: {error:?}")
+            })?;
+            crate::dashboard_users::validate_password(password).map_err(|error| {
+                anyhow::anyhow!("invalid management dashboard_password: {error:?}")
+            })?;
+            if self.management.bearer_token_ttl_ms == 0 {
+                anyhow::bail!("management bearer_token_ttl_ms must be greater than zero");
+            }
+            if self.management.bearer_max_tokens == 0 {
+                anyhow::bail!("management bearer_max_tokens must be greater than zero");
+            }
         }
         Ok(())
     }
